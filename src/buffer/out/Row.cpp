@@ -173,7 +173,7 @@ void ROW::_init() noexcept
         // Since we want to exit the main loop with at least 1 write left to do as the final write,
         // we need to subtract 1 alignment from the buffer length (= 16 bytes). Since _columnCount is
         // in wchar_t's we subtract -8. The same applies to the ~7 here vs ~15. If you squint slightly
-        // you'll see how this this effectively the inverse of what CalculateCharsBufferStride does.
+        // you'll see how this is effectively the inverse of what CalculateCharsBufferStride does.
         const auto tailColumnOffset = gsl::narrow_cast<uint16_t>((_columnCount - 8u) & ~7);
         const auto charsEndLoop = chars + tailColumnOffset;
         const auto charOffsetsEndLoop = charOffsets + tailColumnOffset;
