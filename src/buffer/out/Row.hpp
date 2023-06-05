@@ -60,6 +60,23 @@ struct RowWriteState
 class ROW final
 {
 public:
+    // The implicit agreement between ROW and TextBuffer is that the `charsBuffer` and `charOffsetsBuffer`
+    // arrays have a minimum alignment of 16 Bytes and a size of `rowWidth+1`. The former is used to
+    // implement Reset() efficiently via SIMD and the latter is used to store the past-the-end offset
+    // into the `charsBuffer`. Even though the `charsBuffer` could be only `rowWidth` large we need them
+    // to be the same size so that the SIMD code can process both arrays in the same loop simultaneously.
+    // This wastes up to 5.8% memory but increases overall scrolling performance by around 40%.
+    //
+    // This method exists to make this agreement explicit and serve as a reminder.
+    static constexpr size_t CalculateCharsBufferStride(size_t columns) noexcept
+    {
+        return (columns * sizeof(wchar_t) + 16) & ~15;
+    }
+    static constexpr size_t CalculateCharOffsetsBufferStride(size_t columns) noexcept
+    {
+        return (columns * sizeof(uint16_t) + 16) & ~15;
+    }
+
     ROW() = default;
     ROW(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, const TextAttribute& fillAttribute);
 
@@ -76,7 +93,7 @@ public:
     void SetLineRendition(const LineRendition lineRendition) noexcept;
     LineRendition GetLineRendition() const noexcept;
 
-    void Reset(const TextAttribute& attr);
+    void Reset(const TextAttribute& attr) noexcept;
     void TransferAttributes(const til::small_rle<TextAttribute, uint16_t, 1>& attr, til::CoordType newWidth);
 
     til::CoordType NavigateToPrevious(til::CoordType column) const noexcept;

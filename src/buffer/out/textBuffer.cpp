@@ -698,10 +698,8 @@ wil::unique_virtualalloc_ptr<std::byte> TextBuffer::_allocateBuffer(til::size sz
     const auto w = gsl::narrow<uint16_t>(sz.width);
     const auto h = gsl::narrow<uint16_t>(sz.height);
 
-    const auto charsBytes = w * sizeof(wchar_t);
-    // The ROW::_indices array stores 1 more item than the buffer is wide.
-    // That extra column stores the past-the-end _chars pointer.
-    const auto indicesBytes = w * sizeof(uint16_t) + sizeof(uint16_t);
+    const auto charsBytes = ROW::CalculateCharsBufferStride(w);
+    const auto indicesBytes = ROW::CalculateCharOffsetsBufferStride(w);
     const auto rowStride = charsBytes + indicesBytes;
     // 65535*65535 cells would result in a charsAreaSize of 8GiB.
     // --> Use uint64_t so that we can safely do our calculations even on x86.
@@ -926,7 +924,7 @@ til::point TextBuffer::BufferToScreenPosition(const til::point position) const n
 // Routine Description:
 // - Resets the text contents of this buffer with the default character
 //   and the default current color attributes
-void TextBuffer::Reset()
+void TextBuffer::Reset() noexcept
 {
     const auto attr = GetCurrentAttributes();
 

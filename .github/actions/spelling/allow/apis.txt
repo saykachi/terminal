@@ -86,6 +86,7 @@ IObject
 iosfwd
 IPackage
 IPeasant
+isa
 ISetup
 isspace
 IStorage
