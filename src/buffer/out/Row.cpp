@@ -151,9 +151,10 @@ void ROW::_init() noexcept
     alignas(__m256i) static constexpr uint16_t increment16Data[]{ 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16 };
     alignas(__m128i) static constexpr uint16_t increment8Data[]{ 8, 8, 8, 8, 8, 8, 8, 8 };
 
-    // The AVX loop operates on 32 bytes at a minimum, which translates to a a _columnCount of 16,
-    // because _charsBuffer/_charOffsets uses 2 byte large wchar_t/uint16_t respectively.
-    if (__isa_available >= __ISA_AVAILABLE_AVX2 && _columnCount >= 16)
+    // The AVX loop operates on 32 bytes at a minimum. Since _charsBuffer/_charOffsets uses 2 byte large
+    // wchar_t/uint16_t respectively, this translates to 16-element writes, which equals a _columnCount of 15,
+    // because it doesn't include the past-the-end char-offset as described in the _charOffsets member comment.
+    if (__isa_available >= __ISA_AVAILABLE_AVX2 && _columnCount >= 15)
     {
         auto chars = _charsBuffer;
         auto charOffsets = _charOffsets.data();
@@ -243,7 +244,7 @@ void ROW::_init() noexcept
     } while (chars <= charsEnd);
 #else
 #error "Vectorizing this function improves overall performance by up to 40%. Don't remove this warning, just add the vectorized code."
-    std::fill_n(_chars.begin(), _columnCount, UNICODE_SPACE);
+    std::fill_n(_charsBuffer, _columnCount, UNICODE_SPACE);
     std::iota(_charOffsets.begin(), _charOffsets.end(), uint16_t{ 0 });
 #endif
 
