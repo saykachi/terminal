@@ -60,6 +60,19 @@ struct RowWriteState
 class ROW final
 {
 public:
+    static constexpr size_t CalculateRowSize() noexcept
+    {
+        return sizeof(ROW);
+    }
+    static constexpr size_t CalculateCharsBufferSize(size_t columns) noexcept
+    {
+        return columns * sizeof(wchar_t);
+    }
+    static constexpr size_t CalculateCharOffsetsBufferSize(size_t columns) noexcept
+    {
+        return (columns + 1) * sizeof(uint16_t);
+    }
+
     ROW() = default;
     ROW(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, const TextAttribute& fillAttribute);
 
@@ -76,7 +89,7 @@ public:
     void SetLineRendition(const LineRendition lineRendition) noexcept;
     LineRendition GetLineRendition() const noexcept;
 
-    void Reset(const TextAttribute& attr);
+    void Reset(const TextAttribute& attr) noexcept;
     void TransferAttributes(const til::small_rle<TextAttribute, uint16_t, 1>& attr, til::CoordType newWidth);
 
     til::CoordType NavigateToPrevious(til::CoordType column) const noexcept;

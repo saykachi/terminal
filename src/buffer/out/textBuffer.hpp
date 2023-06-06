@@ -72,7 +72,13 @@ public:
                const UINT cursorSize,
                const bool isActiveBuffer,
                Microsoft::Console::Render::Renderer& renderer);
-    TextBuffer(const TextBuffer& a) = delete;
+
+    TextBuffer(const TextBuffer&) = delete;
+    TextBuffer(TextBuffer&&) = delete;
+    TextBuffer& operator=(const TextBuffer&) = delete;
+    TextBuffer& operator=(TextBuffer&&) = delete;
+
+    ~TextBuffer();
 
     // Used for duplicating properties to another text buffer
     void CopyProperties(const TextBuffer& OtherBuffer) noexcept;
@@ -138,7 +144,7 @@ public:
     til::point ScreenToBufferPosition(const til::point position) const noexcept;
     til::point BufferToScreenPosition(const til::point position) const noexcept;
 
-    void Reset();
+    void Reset() noexcept;
 
     [[nodiscard]] HRESULT ResizeTraditional(const til::size newSize) noexcept;
 
@@ -219,8 +225,32 @@ public:
     interval_tree::IntervalTree<til::point, size_t> GetPatterns(const til::CoordType firstRow, const til::CoordType lastRow) const;
 
 private:
-    static wil::unique_virtualalloc_ptr<std::byte> _allocateBuffer(til::size sz, const TextAttribute& attributes, std::vector<ROW>& rows);
+    // Technically this structure could be the TextBuffer class itself, but at the time of writing
+    // TextBuffer::ResizeTraditional() expects to be able to allocate another TextBuffer storage,
+    // modify it, and if it worked, write it back into the current TextBuffer. It'd be possible to
+    // allocate a TextBuffer instead, but I chose this approach (creating another struct).
+    // There's no real fundamental reason for that.
+    struct VirtualAllocation
+    {
+        VirtualAllocation() = default;
+        VirtualAllocation(til::size sz, const TextAttribute& attributes);
 
+        ~VirtualAllocation();
+
+        VirtualAllocation(const VirtualAllocation&) = delete;
+        VirtualAllocation& operator=(const VirtualAllocation&) = delete;
+
+        VirtualAllocation(VirtualAllocation&&) = default;
+        VirtualAllocation& operator=(VirtualAllocation&&) = default;
+
+        void Reset(const TextAttribute& attributes) noexcept;
+
+    private:
+    };
+
+    ROW& _getRowByOffset(til::CoordType y) noexcept;
+    ROW* _getRowByOffsetNoInit(til::CoordType y) const noexcept;
+    ROW& _getRowByOffsetDirect(size_t offset) noexcept;
     void _UpdateSize();
     void _SetFirstRowIndex(const til::CoordType FirstRowIndex) noexcept;
     til::point _GetPreviousFromCursor() const noexcept;
@@ -229,7 +259,6 @@ private:
     // Assist with maintaining proper buffer state for Double Byte character sequences
     bool _PrepareForDoubleByteSequence(const DbcsAttribute dbcsAttribute);
     bool _AssertValidDoubleByteSequence(const DbcsAttribute dbcsAttribute);
-    ROW& _GetFirstRow() noexcept;
     void _ExpandTextRow(til::inclusive_rect& selectionRow) const;
     DelimiterClass _GetDelimiterClassAt(const til::point pos, const std::wstring_view wordDelimiters) const noexcept;
     til::point _GetWordStartForAccessibility(const til::point target, const std::wstring_view wordDelimiters) const noexcept;
@@ -249,8 +278,16 @@ private:
     std::unordered_map<size_t, std::wstring> _idsAndPatterns;
     size_t _currentPatternId = 0;
 
-    wil::unique_virtualalloc_ptr<std::byte> _charBuffer;
-    std::vector<ROW> _storage;
+    wil::unique_virtualalloc_ptr<std::byte> _buffer;
+    std::byte* _bufferEnd = nullptr;
+    std::byte* _commitWatermark = nullptr;
+    TextAttribute _initialAttributes;
+    size_t _bufferRowStride = 0;
+    size_t _charsBufferOffset = 0;
+    size_t _charOffsetsBufferOffset = 0;
+    size_t _rowCount = 0;
+    uint16_t _columnCount = 0;
+
     TextAttribute _currentAttributes;
     til::CoordType _firstRow = 0; // indexes top row (not necessarily 0)
 

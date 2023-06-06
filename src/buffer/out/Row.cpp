@@ -82,11 +82,8 @@ ROW::ROW(wchar_t* charsBuffer, uint16_t* charOffsetsBuffer, uint16_t rowWidth, c
     _attr{ rowWidth, fillAttribute },
     _columnCount{ rowWidth }
 {
-    if (_chars.data())
-    {
         _init();
     }
-}
 
 void ROW::SetWrapForced(const bool wrap) noexcept
 {
@@ -124,7 +121,7 @@ LineRendition ROW::GetLineRendition() const noexcept
 // - Attr - The default attribute (color) to fill
 // Return Value:
 // - <none>
-void ROW::Reset(const TextAttribute& attr)
+void ROW::Reset(const TextAttribute& attr) noexcept
 {
     _charsHeap.reset();
     _chars = { _charsBuffer, _columnCount };

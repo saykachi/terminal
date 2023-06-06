@@ -42,8 +42,44 @@ TextBuffer::TextBuffer(til::size screenBufferSize,
     // Guard against resizing the text buffer to 0 columns/rows, which would break being able to insert text.
     screenBufferSize.width = std::max(screenBufferSize.width, 1);
     screenBufferSize.height = std::max(screenBufferSize.height, 1);
-    _charBuffer = _allocateBuffer(screenBufferSize, _currentAttributes, _storage);
+
+    {
+        const auto w = gsl::narrow<uint16_t>(screenBufferSize.width);
+        const auto h = gsl::narrow<uint16_t>(screenBufferSize.height);
+
+        // 65535*65535 cells would result in a charsAreaSize of 8GiB.
+        // --> Use uint64_t so that we can safely do our calculations even on x86.
+        const auto rowSize = ROW::CalculateRowSize();
+        const auto charsBufferSize = ROW::CalculateCharsBufferSize(w);
+        const auto charOffsetsBufferSize = ROW::CalculateCharOffsetsBufferSize(w);
+        const auto rowStride = rowSize + charsBufferSize + charOffsetsBufferSize;
+        const auto allocSize2 = gsl::narrow<size_t>(::base::strict_cast<uint64_t>(h) * rowStride);
+
+        _buffer = wil::unique_virtualalloc_ptr<std::byte>{ static_cast<std::byte*>(VirtualAlloc(nullptr, allocSize2, MEM_RESERVE, PAGE_READWRITE)) };
+        THROW_IF_NULL_ALLOC(_buffer);
+
+        _bufferEnd = _buffer.get() + allocSize2;
+        _commitWatermark = _buffer.get();
+        _initialAttributes = defaultAttributes;
+        _bufferRowStride = rowStride;
+        _charsBufferOffset = rowSize;
+        _charOffsetsBufferOffset = rowSize + charsBufferSize;
+        _rowCount = h;
+        _columnCount = w;
+    }
+
     _UpdateSize();
+}
+
+TextBuffer::~TextBuffer()
+{
+    if (_buffer)
+    {
+        for (auto it = _buffer.get(); it < _commitWatermark; it += _bufferRowStride)
+        {
+            std::destroy_at(reinterpret_cast<ROW*>(it));
+        }
+    }
 }
 
 // Routine Description:
@@ -66,7 +102,7 @@ void TextBuffer::CopyProperties(const TextBuffer& OtherBuffer) noexcept
 // - Total number of rows in the buffer
 til::CoordType TextBuffer::TotalRowCount() const noexcept
 {
-    return gsl::narrow_cast<til::CoordType>(_storage.size());
+    return gsl::narrow_cast<til::CoordType>(_rowCount);
 }
 
 // Routine Description:
@@ -78,9 +114,9 @@ til::CoordType TextBuffer::TotalRowCount() const noexcept
 // - const reference to the requested row. Asserts if out of bounds.
 const ROW& TextBuffer::GetRowByOffset(const til::CoordType index) const noexcept
 {
-    // Rows are stored circularly, so the index you ask for is offset by the start position and mod the total of rows.
-    const auto offsetIndex = gsl::narrow_cast<size_t>(_firstRow + index) % _storage.size();
-    return til::at(_storage, offsetIndex);
+    // The const_cast is safe because "const" never had any meaning in C++ in the first place.
+#pragma warning(suppress : 26492) // Don't use const_cast to cast away const or volatile (type.3).
+    return const_cast<TextBuffer*>(this)->GetRowByOffset(index);
 }
 
 // Routine Description:
@@ -93,8 +129,7 @@ const ROW& TextBuffer::GetRowByOffset(const til::CoordType index) const noexcept
 ROW& TextBuffer::GetRowByOffset(const til::CoordType index) noexcept
 {
     // Rows are stored circularly, so the index you ask for is offset by the start position and mod the total of rows.
-    const auto offsetIndex = gsl::narrow_cast<size_t>(_firstRow + index) % _storage.size();
-    return til::at(_storage, offsetIndex);
+    return _getRowByOffset(_firstRow + index);
 }
 
 // Routine Description:
@@ -693,40 +728,47 @@ const Viewport TextBuffer::GetSize() const noexcept
     return _size;
 }
 
-wil::unique_virtualalloc_ptr<std::byte> TextBuffer::_allocateBuffer(til::size sz, const TextAttribute& attributes, std::vector<ROW>& rows)
+ROW& TextBuffer::_getRowByOffset(til::CoordType y) noexcept
 {
-    const auto w = gsl::narrow<uint16_t>(sz.width);
-    const auto h = gsl::narrow<uint16_t>(sz.height);
+    return _getRowByOffsetDirect(gsl::narrow_cast<size_t>(y) % _rowCount);
+}
 
-    const auto charsBytes = w * sizeof(wchar_t);
-    // The ROW::_indices array stores 1 more item than the buffer is wide.
-    // That extra column stores the past-the-end _chars pointer.
-    const auto indicesBytes = w * sizeof(uint16_t) + sizeof(uint16_t);
-    const auto rowStride = charsBytes + indicesBytes;
-    // 65535*65535 cells would result in a charsAreaSize of 8GiB.
-    // --> Use uint64_t so that we can safely do our calculations even on x86.
-    const auto allocSize = gsl::narrow<size_t>(::base::strict_cast<uint64_t>(rowStride) * ::base::strict_cast<uint64_t>(h));
+ROW* TextBuffer::_getRowByOffsetNoInit(til::CoordType y) const noexcept
+{
+    const auto offset = gsl::narrow_cast<size_t>(y) % _rowCount;
+    const auto rowBeg = _buffer.get() + _bufferRowStride * offset;
+    return rowBeg < _commitWatermark ? reinterpret_cast<ROW*>(rowBeg) : nullptr;
+}
 
-    auto buffer = wil::unique_virtualalloc_ptr<std::byte>{ static_cast<std::byte*>(VirtualAlloc(nullptr, allocSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) };
-    THROW_IF_NULL_ALLOC(buffer);
+ROW& TextBuffer::_getRowByOffsetDirect(size_t offset) noexcept
+{
+    const auto rowBeg = _buffer.get() + _bufferRowStride * offset;
 
-    auto data = std::span{ buffer.get(), allocSize }.begin();
-
-    rows.resize(h);
-    for (auto& row : rows)
+    if (rowBeg >= _commitWatermark)
     {
-        const auto chars = til::bit_cast<wchar_t*>(&*data);
-        const auto indices = til::bit_cast<uint16_t*>(&*(data + charsBytes));
-        row = { chars, indices, w, attributes };
-        data += rowStride;
+        const auto rowEnd = rowBeg + _bufferRowStride;
+        const auto remaining = static_cast<uintptr_t>(_bufferEnd - _commitWatermark);
+        const auto minimum = static_cast<uintptr_t>(rowEnd - _commitWatermark);
+        const auto ideal = minimum + _bufferRowStride * 64;
+        const auto size = std::min(remaining, ideal);
+
+        VirtualAlloc(_commitWatermark, size, MEM_COMMIT, PAGE_READWRITE);
+
+        for (const auto end = _commitWatermark + size; _commitWatermark < end; _commitWatermark += _bufferRowStride)
+        {
+            const auto row = reinterpret_cast<ROW*>(_commitWatermark);
+            const auto chars = reinterpret_cast<wchar_t*>(_commitWatermark + _charsBufferOffset);
+            const auto indices = reinterpret_cast<uint16_t*>(_commitWatermark + _charOffsetsBufferOffset);
+            std::construct_at(row, chars, indices, _columnCount, _initialAttributes);
+        }
     }
 
-    return buffer;
+    return *reinterpret_cast<ROW*>(rowBeg);
 }
 
 void TextBuffer::_UpdateSize()
 {
-    _size = Viewport::FromDimensions({ _storage.at(0).size(), gsl::narrow<til::CoordType>(_storage.size()) });
+    _size = Viewport::FromDimensions({ _columnCount, gsl::narrow<til::CoordType>(_rowCount) });
 }
 
 void TextBuffer::_SetFirstRowIndex(const til::CoordType FirstRowIndex) noexcept
@@ -736,11 +778,16 @@ void TextBuffer::_SetFirstRowIndex(const til::CoordType FirstRowIndex) noexcept
 
 void TextBuffer::ScrollRows(const til::CoordType firstRow, const til::CoordType size, const til::CoordType delta)
 {
+    UNREFERENCED_PARAMETER(firstRow);
+    UNREFERENCED_PARAMETER(size);
+
     // If we don't have to move anything, leave early.
     if (delta == 0)
     {
         return;
     }
+
+    __debugbreak();
 
     // OK. We're about to play games by moving rows around within the deque to
     // scroll a massive region in a faster way than copying things.
@@ -748,7 +795,7 @@ void TextBuffer::ScrollRows(const til::CoordType firstRow, const til::CoordType 
     if (_firstRow != 0)
     {
         // Rotate the buffer to put the first row at the front.
-        std::rotate(_storage.begin(), _storage.begin() + _firstRow, _storage.end());
+        //std::rotate(_storage.begin(), _storage.begin() + _firstRow, _storage.end());
 
         // The first row is now at the top.
         _firstRow = 0;
@@ -790,7 +837,7 @@ void TextBuffer::ScrollRows(const til::CoordType firstRow, const til::CoordType 
         // | 10
         // | 11
         // - end
-        std::rotate(_storage.begin() + firstRow + delta, _storage.begin() + firstRow, _storage.begin() + firstRow + size);
+        //std::rotate(_storage.begin() + firstRow + delta, _storage.begin() + firstRow, _storage.begin() + firstRow + size);
     }
     else
     {
@@ -827,7 +874,7 @@ void TextBuffer::ScrollRows(const til::CoordType firstRow, const til::CoordType 
         // | 10
         // | 11
         // - end
-        std::rotate(_storage.begin() + firstRow, _storage.begin() + firstRow + size, _storage.begin() + firstRow + size + delta);
+        //std::rotate(_storage.begin() + firstRow, _storage.begin() + firstRow + size, _storage.begin() + firstRow + size + delta);
     }
 }
 
@@ -926,14 +973,17 @@ til::point TextBuffer::BufferToScreenPosition(const til::point position) const n
 // Routine Description:
 // - Resets the text contents of this buffer with the default character
 //   and the default current color attributes
-void TextBuffer::Reset()
+void TextBuffer::Reset() noexcept
 {
-    const auto attr = GetCurrentAttributes();
-
-    for (auto& row : _storage)
+    for (auto it = _buffer.get(); it < _commitWatermark; it += _bufferRowStride)
     {
-        row.Reset(attr);
+        std::destroy_at(reinterpret_cast<ROW*>(it));
     }
+
+    VirtualAlloc(_buffer.get(), _commitWatermark - _buffer.get(), MEM_DECOMMIT, PAGE_READWRITE);
+
+    _commitWatermark = _buffer.get();
+    _initialAttributes = _currentAttributes;
 }
 
 // Routine Description:
@@ -955,47 +1005,43 @@ void TextBuffer::Reset()
         {
             TopRow = GetCursor().GetPosition().y - newSize.height + 1;
         }
-        const auto TopRowIndex = gsl::narrow_cast<size_t>(_firstRow + TopRow) % _storage.size();
 
-        std::vector<ROW> newStorage;
-        auto newBuffer = _allocateBuffer(newSize, _currentAttributes, newStorage);
+        TextBuffer newBuffer{ newSize, _currentAttributes, 0, false, _renderer };
 
         // This basically imitates a std::rotate_copy(first, mid, last), but uses ROW::CopyRangeFrom() to do the copying.
         {
-            const auto first = _storage.begin();
-            const auto last = _storage.end();
-            const auto mid = first + TopRowIndex;
-            auto dest = newStorage.begin();
+            const auto last = gsl::narrow_cast<til::CoordType>(_rowCount);
+            const auto mid = _firstRow + TopRow % last;
+            til::CoordType dest = 0;
 
-            std::span<ROW> sourceRanges[]{
-                { mid, last },
-                { first, mid },
-            };
-
-            // Ensure we don't copy more from `_storage` than fit into `newStorage`.
-            if (sourceRanges[0].size() > newStorage.size())
+            for (auto y = mid; y < last && dest < newSize.height; ++y, ++dest)
             {
-                sourceRanges[0] = sourceRanges[0].subspan(0, newStorage.size());
-            }
-            if (const auto remaining = newStorage.size() - sourceRanges[0].size(); sourceRanges[1].size() > remaining)
-            {
-                sourceRanges[1] = sourceRanges[1].subspan(0, remaining);
+                const auto& oldRow = GetRowByOffset(y);
+                auto& newRow = newBuffer.GetRowByOffset(dest);
+                til::CoordType begin = 0;
+                newRow.CopyRangeFrom(0, til::CoordTypeMax, oldRow, begin, til::CoordTypeMax);
+                newRow.TransferAttributes(oldRow.Attributes(), newSize.width);
             }
 
-            for (const auto& sourceRange : sourceRanges)
+            for (auto y = 0; y < mid && dest < newSize.height; ++y, ++dest)
             {
-                for (const auto& oldRow : sourceRange)
-                {
-                    til::CoordType begin = 0;
-                    dest->CopyRangeFrom(0, til::CoordTypeMax, oldRow, begin, til::CoordTypeMax);
-                    dest->TransferAttributes(oldRow.Attributes(), newSize.width);
-                    ++dest;
-                }
+                const auto& oldRow = GetRowByOffset(y);
+                auto& newRow = newBuffer.GetRowByOffset(dest);
+                til::CoordType begin = 0;
+                newRow.CopyRangeFrom(0, til::CoordTypeMax, oldRow, begin, til::CoordTypeMax);
+                newRow.TransferAttributes(oldRow.Attributes(), newSize.width);
             }
         }
 
-        _charBuffer = std::move(newBuffer);
-        _storage = std::move(newStorage);
+        _buffer = std::move(newBuffer._buffer);
+        _bufferEnd = newBuffer._bufferEnd;
+        _commitWatermark = newBuffer._commitWatermark;
+        _initialAttributes = newBuffer._initialAttributes;
+        _bufferRowStride = newBuffer._bufferRowStride;
+        _charsBufferOffset = newBuffer._charsBufferOffset;
+        _charOffsetsBufferOffset = newBuffer._charOffsetsBufferOffset;
+        _rowCount = newBuffer._rowCount;
+        _columnCount = newBuffer._columnCount;
 
         _SetFirstRowIndex(0);
         _UpdateSize();
@@ -1066,17 +1112,6 @@ void TextBuffer::TriggerNewTextNotification(const std::wstring_view newText)
     {
         _renderer.TriggerNewTextNotification(newText);
     }
-}
-
-// Routine Description:
-// - Retrieves the first row from the underlying buffer.
-// Arguments:
-// - <none>
-// Return Value:
-//  - reference to the first row.
-ROW& TextBuffer::_GetFirstRow() noexcept
-{
-    return GetRowByOffset(0);
 }
 
 // Method Description:
